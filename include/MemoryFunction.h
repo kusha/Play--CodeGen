@@ -36,6 +36,7 @@ private:
 	void Reset();
 
 	void* m_code;
+	void* m_codeRW;
 	size_t m_size;
 #if defined(__EMSCRIPTEN__)
 	emscripten::val m_wasmModule;

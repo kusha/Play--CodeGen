@@ -22,11 +22,10 @@
 		#if TARGET_CPU_ARM64
 			#define MEMFUNC_MMAP_REQUIRES_JIT_WRITE_PROTECT
 		#endif
+	#elif TARGET_OS_IPHONE
+		#define MEMFUNC_USE_IOS_TXM
 	#else
 		#define MEMFUNC_USE_MACHVM
-		#if TARGET_OS_IPHONE
-			#define MEMFUNC_MACHVM_STRICT_PROTECTION
-		#endif
 	#endif
 #elif defined(__EMSCRIPTEN__)
 	#include <emscripten.h>
@@ -40,6 +39,11 @@
 #elif defined(MEMFUNC_USE_MACHVM)
 #include <mach/mach_init.h>
 #include <mach/vm_map.h>
+#elif defined(MEMFUNC_USE_IOS_TXM)
+#include <mach/mach_init.h>
+#include <mach/vm_map.h>
+#include <sys/mman.h>
+#include <unistd.h>
 #elif defined(MEMFUNC_USE_MMAP)
 #include <sys/mman.h>
 #include <pthread.h>
@@ -80,15 +84,46 @@ EM_JS(emscripten::EM_VAL, WasmCreateModule, (uintptr_t code, uintptr_t size),
 #error "No API to use for CMemoryFunction"
 #endif
 
+#ifdef MEMFUNC_USE_IOS_TXM
+// JIT26PrepareRegion: triggers brk #0xf00d breakpoint that StikDebug catches.
+// StikDebug's universal.js script handles x16=1 by calling prepare_memory_region()
+// to mark the memory as a JIT region in iOS 26's TXM (Trust eXecution Monitor).
+// x0 = address, x1 = size, x16 = command (1 = prepare region)
+__attribute__((noinline, optnone, naked))
+static void* JIT26PrepareRegion(void* addr, size_t size)
+{
+    __asm__ volatile(
+        "mov x16, #1\n"
+        "brk #0xf00d\n"
+        "ret\n"
+    );
+}
+#endif
+
 CMemoryFunction::CMemoryFunction()
 : m_code(nullptr)
+, m_codeRW(nullptr)
 , m_size(0)
 {
 
 }
 
+CMemoryFunction::CMemoryFunction(CMemoryFunction&& rhs)
+: m_code(nullptr)
+, m_codeRW(nullptr)
+, m_size(0)
+{
+	std::swap(m_code, rhs.m_code);
+	std::swap(m_codeRW, rhs.m_codeRW);
+	std::swap(m_size, rhs.m_size);
+#if defined(MEMFUNC_USE_WASM)
+	std::swap(m_wasmModule, rhs.m_wasmModule);
+#endif
+}
+
 CMemoryFunction::CMemoryFunction(const void* code, size_t size)
 : m_code(nullptr)
+, m_codeRW(nullptr)
 {
 #if defined(MEMFUNC_USE_WIN32)
 	m_size = size;
@@ -112,6 +147,32 @@ CMemoryFunction::CMemoryFunction(const void* code, size_t size)
 	#endif
 	kern_return_t result = vm_protect(mach_task_self(), reinterpret_cast<vm_address_t>(m_code), size, 0, protection);
 	assert(result == 0);
+	m_size = allocSize;
+#elif defined(MEMFUNC_USE_IOS_TXM)
+	long page_size = sysconf(_SC_PAGESIZE);
+	size_t allocSize = ((size + page_size - 1) / page_size) * page_size;
+
+	void* rwMapping = mmap(nullptr, allocSize, PROT_READ | PROT_WRITE, MAP_ANON | MAP_PRIVATE, -1, 0);
+	assert(rwMapping != MAP_FAILED);
+
+	vm_address_t rxMapping = 0;
+	vm_prot_t cur_prot, max_prot;
+	kern_return_t kr = vm_remap(mach_task_self(), &rxMapping, allocSize, 0,
+								VM_FLAGS_ANYWHERE | VM_FLAGS_RANDOM_ADDR,
+								mach_task_self(), (mach_vm_address_t)rwMapping,
+								false, &cur_prot, &max_prot, VM_INHERIT_NONE);
+	assert(kr == KERN_SUCCESS);
+
+	void* preparedAddr = JIT26PrepareRegion(reinterpret_cast<void*>(rxMapping), allocSize);
+	if(preparedAddr != nullptr && preparedAddr != reinterpret_cast<void*>(rxMapping))
+	{
+		rxMapping = reinterpret_cast<vm_address_t>(preparedAddr);
+	}
+
+	memcpy(rwMapping, code, size);
+
+	m_code = reinterpret_cast<void*>(rxMapping);
+	m_codeRW = rwMapping;
 	m_size = allocSize;
 #elif defined(MEMFUNC_USE_MMAP)
 	uint32 additionalMapFlags = 0;
@@ -163,6 +224,9 @@ void CMemoryFunction::Reset()
 		framework_aligned_free(m_code);
 #elif defined(MEMFUNC_USE_MACHVM)
 		vm_deallocate(mach_task_self(), reinterpret_cast<vm_address_t>(m_code), m_size);
+#elif defined(MEMFUNC_USE_IOS_TXM)
+		munmap(m_codeRW, m_size);
+		vm_deallocate(mach_task_self(), reinterpret_cast<vm_address_t>(m_code), m_size);
 #elif defined(MEMFUNC_USE_MMAP)
 		munmap(m_code, m_size);
 #elif defined(MEMFUNC_USE_WASM)
@@ -170,6 +234,7 @@ void CMemoryFunction::Reset()
 #endif
 	}
 	m_code = nullptr;
+	m_codeRW = nullptr;
 	m_size = 0;
 #if defined(MEMFUNC_USE_WASM)
 	m_wasmModule = emscripten::val();
@@ -185,6 +250,7 @@ CMemoryFunction& CMemoryFunction::operator =(CMemoryFunction&& rhs)
 {
 	Reset();
 	std::swap(m_code, rhs.m_code);
+	std::swap(m_codeRW, rhs.m_codeRW);
 	std::swap(m_size, rhs.m_size);
 #if defined(MEMFUNC_USE_WASM)
 	std::swap(m_wasmModule, rhs.m_wasmModule);
@@ -214,6 +280,10 @@ void CMemoryFunction::BeginModify()
 #if defined(MEMFUNC_USE_MACHVM) && defined(MEMFUNC_MACHVM_STRICT_PROTECTION)
 	kern_return_t result = vm_protect(mach_task_self(), reinterpret_cast<vm_address_t>(m_code), m_size, 0, VM_PROT_READ | VM_PROT_WRITE);
 	assert(result == 0);
+#elif defined(MEMFUNC_USE_IOS_TXM)
+	void* rxAddr = m_code;
+	m_code = m_codeRW;
+	m_codeRW = rxAddr;
 #elif defined(MEMFUNC_USE_MMAP) && defined(MEMFUNC_MMAP_REQUIRES_JIT_WRITE_PROTECT)
 	pthread_jit_write_protect_np(false);
 #endif
@@ -224,6 +294,10 @@ void CMemoryFunction::EndModify()
 #if defined(MEMFUNC_USE_MACHVM) && defined(MEMFUNC_MACHVM_STRICT_PROTECTION)
 	kern_return_t result = vm_protect(mach_task_self(), reinterpret_cast<vm_address_t>(m_code), m_size, 0, VM_PROT_READ | VM_PROT_EXECUTE);
 	assert(result == 0);
+#elif defined(MEMFUNC_USE_IOS_TXM)
+	void* rwAddr = m_code;
+	m_code = m_codeRW;
+	m_codeRW = rwAddr;
 #elif defined(MEMFUNC_USE_MMAP) && defined(MEMFUNC_MMAP_REQUIRES_JIT_WRITE_PROTECT)
 	pthread_jit_write_protect_np(true);
 #endif
