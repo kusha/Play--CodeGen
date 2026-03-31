@@ -40,8 +40,6 @@
 #include <mach/mach_init.h>
 #include <mach/vm_map.h>
 #elif defined(MEMFUNC_USE_IOS_TXM)
-#include <mach/mach_init.h>
-#include <mach/vm_map.h>
 #include <sys/mman.h>
 #include <unistd.h>
 #elif defined(MEMFUNC_USE_MMAP)
@@ -100,15 +98,27 @@ static bool MakeExecutableWithRetry(void* addr, size_t size)
 {
 	if(mprotect(addr, size, PROT_READ | PROT_EXEC) == 0) return true;
 
-	if(errno == EPERM || errno == EACCES)
+	for(int i = 0; i < 200; i++)
 	{
-		for(int i = 0; i < 40; i++)
+		usleep(50000);
+		if(IsProcessDebugged())
 		{
-			usleep(50000);
-			if(IsProcessDebugged())
-			{
-				if(mprotect(addr, size, PROT_READ | PROT_EXEC) == 0) return true;
-			}
+			if(mprotect(addr, size, PROT_READ | PROT_EXEC) == 0) return true;
+		}
+	}
+	return false;
+}
+
+static bool MakeWritableWithRetry(void* addr, size_t size)
+{
+	if(mprotect(addr, size, PROT_READ | PROT_WRITE) == 0) return true;
+
+	for(int i = 0; i < 200; i++)
+	{
+		usleep(50000);
+		if(IsProcessDebugged())
+		{
+			if(mprotect(addr, size, PROT_READ | PROT_WRITE) == 0) return true;
 		}
 	}
 	return false;
@@ -167,24 +177,14 @@ CMemoryFunction::CMemoryFunction(const void* code, size_t size)
 	long page_size = sysconf(_SC_PAGESIZE);
 	size_t allocSize = ((size + page_size - 1) / page_size) * page_size;
 
-	void* rwMapping = mmap(nullptr, allocSize, PROT_READ | PROT_WRITE, MAP_ANON | MAP_PRIVATE, -1, 0);
-	assert(rwMapping != MAP_FAILED);
+	m_code = mmap(nullptr, allocSize, PROT_READ | PROT_WRITE, MAP_ANON | MAP_PRIVATE, -1, 0);
+	assert(m_code != MAP_FAILED);
 
-	vm_address_t rxMapping = 0;
-	vm_prot_t cur_prot, max_prot;
-	kern_return_t kr = vm_remap(mach_task_self(), &rxMapping, allocSize, 0,
-								VM_FLAGS_ANYWHERE | VM_FLAGS_RANDOM_ADDR,
-								mach_task_self(), (mach_vm_address_t)rwMapping,
-								false, &cur_prot, &max_prot, VM_INHERIT_NONE);
-	assert(kr == KERN_SUCCESS);
+	memcpy(m_code, code, size);
 
-	bool rxOk = MakeExecutableWithRetry(reinterpret_cast<void*>(rxMapping), allocSize);
-	assert(rxOk);
+	bool rxOk = MakeExecutableWithRetry(m_code, allocSize);
+	if(!rxOk) abort();
 
-	memcpy(rwMapping, code, size);
-
-	m_code = reinterpret_cast<void*>(rxMapping);
-	m_codeRW = rwMapping;
 	m_size = allocSize;
 #elif defined(MEMFUNC_USE_MMAP)
 	uint32 additionalMapFlags = 0;
@@ -237,8 +237,7 @@ void CMemoryFunction::Reset()
 #elif defined(MEMFUNC_USE_MACHVM)
 		vm_deallocate(mach_task_self(), reinterpret_cast<vm_address_t>(m_code), m_size);
 #elif defined(MEMFUNC_USE_IOS_TXM)
-		munmap(m_codeRW, m_size);
-		vm_deallocate(mach_task_self(), reinterpret_cast<vm_address_t>(m_code), m_size);
+		munmap(m_code, m_size);
 #elif defined(MEMFUNC_USE_MMAP)
 		munmap(m_code, m_size);
 #elif defined(MEMFUNC_USE_WASM)
@@ -293,9 +292,7 @@ void CMemoryFunction::BeginModify()
 	kern_return_t result = vm_protect(mach_task_self(), reinterpret_cast<vm_address_t>(m_code), m_size, 0, VM_PROT_READ | VM_PROT_WRITE);
 	assert(result == 0);
 #elif defined(MEMFUNC_USE_IOS_TXM)
-	void* rxAddr = m_code;
-	m_code = m_codeRW;
-	m_codeRW = rxAddr;
+	MakeWritableWithRetry(m_code, m_size);
 #elif defined(MEMFUNC_USE_MMAP) && defined(MEMFUNC_MMAP_REQUIRES_JIT_WRITE_PROTECT)
 	pthread_jit_write_protect_np(false);
 #endif
@@ -307,9 +304,7 @@ void CMemoryFunction::EndModify()
 	kern_return_t result = vm_protect(mach_task_self(), reinterpret_cast<vm_address_t>(m_code), m_size, 0, VM_PROT_READ | VM_PROT_EXECUTE);
 	assert(result == 0);
 #elif defined(MEMFUNC_USE_IOS_TXM)
-	void* rwAddr = m_code;
-	m_code = m_codeRW;
-	m_codeRW = rwAddr;
+	MakeExecutableWithRetry(m_code, m_size);
 #elif defined(MEMFUNC_USE_MMAP) && defined(MEMFUNC_MMAP_REQUIRES_JIT_WRITE_PROTECT)
 	pthread_jit_write_protect_np(true);
 #endif
