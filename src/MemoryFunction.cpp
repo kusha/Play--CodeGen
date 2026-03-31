@@ -43,6 +43,7 @@
 #include <sys/mman.h>
 #include <unistd.h>
 #include <pthread.h>
+#include <dlfcn.h>
 #include <os/log.h>
 #elif defined(MEMFUNC_USE_MMAP)
 #include <sys/mman.h>
@@ -122,8 +123,30 @@ enum class IosJitStrategy
 
 static IosJitStrategy g_jitStrategy = IosJitStrategy::None;
 
+typedef void (*PthreadJitWriteProtectFn)(int);
+static PthreadJitWriteProtectFn g_pthreadJitWriteProtect = nullptr;
+
+static bool InitJitWriteProtect()
+{
+	if(g_pthreadJitWriteProtect) return true;
+	g_pthreadJitWriteProtect = (PthreadJitWriteProtectFn)dlsym(RTLD_DEFAULT, "pthread_jit_write_protect_np");
+	return g_pthreadJitWriteProtect != nullptr;
+}
+
+static void JitWriteProtect(bool protect)
+{
+	if(g_pthreadJitWriteProtect)
+		g_pthreadJitWriteProtect(protect ? 1 : 0);
+}
+
 static void* AllocateMapJit(size_t allocSize)
 {
+	if(!InitJitWriteProtect())
+	{
+		os_log_error(GetJitLog(), "pthread_jit_write_protect_np not available");
+		return nullptr;
+	}
+
 	void* p = mmap(nullptr, allocSize, PROT_READ | PROT_WRITE | PROT_EXEC,
 	               MAP_ANON | MAP_PRIVATE | MAP_JIT, -1, 0);
 	if(p == MAP_FAILED)
@@ -220,9 +243,9 @@ CMemoryFunction::CMemoryFunction(const void* code, size_t size)
 		g_jitStrategy = IosJitStrategy::MapJit;
 		m_code = jitMem;
 		m_codeRW = jitMem;
-		pthread_jit_write_protect_np(0);
+		JitWriteProtect(false);
 		memcpy(m_code, code, size);
-		pthread_jit_write_protect_np(1);
+		JitWriteProtect(true);
 		m_size = allocSize;
 	}
 	else
@@ -353,7 +376,7 @@ void CMemoryFunction::BeginModify()
 	switch(g_jitStrategy)
 	{
 	case IosJitStrategy::MapJit:
-		pthread_jit_write_protect_np(0);
+		JitWriteProtect(false);
 		break;
 	case IosJitStrategy::RxMprotect:
 		mprotect(m_code, m_size, PROT_READ | PROT_WRITE);
@@ -375,7 +398,7 @@ void CMemoryFunction::EndModify()
 	switch(g_jitStrategy)
 	{
 	case IosJitStrategy::MapJit:
-		pthread_jit_write_protect_np(1);
+		JitWriteProtect(true);
 		break;
 	case IosJitStrategy::RxMprotect:
 		mprotect(m_code, m_size, PROT_READ | PROT_EXEC);
