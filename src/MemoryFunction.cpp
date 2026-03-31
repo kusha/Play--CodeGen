@@ -23,7 +23,7 @@
 			#define MEMFUNC_MMAP_REQUIRES_JIT_WRITE_PROTECT
 		#endif
 	#elif TARGET_OS_IPHONE
-		#define MEMFUNC_USE_IOS_TXM
+		#define MEMFUNC_USE_IOS_JIT
 	#else
 		#define MEMFUNC_USE_MACHVM
 	#endif
@@ -39,9 +39,11 @@
 #elif defined(MEMFUNC_USE_MACHVM)
 #include <mach/mach_init.h>
 #include <mach/vm_map.h>
-#elif defined(MEMFUNC_USE_IOS_TXM)
+#elif defined(MEMFUNC_USE_IOS_JIT)
 #include <sys/mman.h>
 #include <unistd.h>
+#include <pthread.h>
+#include <os/log.h>
 #elif defined(MEMFUNC_USE_MMAP)
 #include <sys/mman.h>
 #include <pthread.h>
@@ -82,10 +84,16 @@ EM_JS(emscripten::EM_VAL, WasmCreateModule, (uintptr_t code, uintptr_t size),
 #error "No API to use for CMemoryFunction"
 #endif
 
-#ifdef MEMFUNC_USE_IOS_TXM
+#ifdef MEMFUNC_USE_IOS_JIT
 #include <errno.h>
 
 extern "C" int csops(pid_t pid, unsigned int ops, void* useraddr, size_t usersize);
+
+static os_log_t GetJitLog()
+{
+	static os_log_t log = os_log_create("org.puredarwin.play", "jit");
+	return log;
+}
 
 static bool IsProcessDebugged()
 {
@@ -94,34 +102,61 @@ static bool IsProcessDebugged()
 	return (flags & 0x10000000 /* CS_DEBUGGED */) != 0;
 }
 
-static bool MakeExecutableWithRetry(void* addr, size_t size)
+static bool WaitForDebugger(int maxWaitMs = 10000)
 {
-	if(mprotect(addr, size, PROT_READ | PROT_EXEC) == 0) return true;
-
-	for(int i = 0; i < 200; i++)
+	if(IsProcessDebugged()) return true;
+	for(int waited = 0; waited < maxWaitMs; waited += 50)
 	{
 		usleep(50000);
-		if(IsProcessDebugged())
-		{
-			if(mprotect(addr, size, PROT_READ | PROT_EXEC) == 0) return true;
-		}
+		if(IsProcessDebugged()) return true;
 	}
 	return false;
 }
 
-static bool MakeWritableWithRetry(void* addr, size_t size)
+enum class IosJitStrategy
 {
-	if(mprotect(addr, size, PROT_READ | PROT_WRITE) == 0) return true;
+	None,
+	MapJit,
+	RxMprotect,
+};
 
-	for(int i = 0; i < 200; i++)
+static IosJitStrategy g_jitStrategy = IosJitStrategy::None;
+
+static void* AllocateMapJit(size_t allocSize)
+{
+	void* p = mmap(nullptr, allocSize, PROT_READ | PROT_WRITE | PROT_EXEC,
+	               MAP_ANON | MAP_PRIVATE | MAP_JIT, -1, 0);
+	if(p == MAP_FAILED)
 	{
-		usleep(50000);
-		if(IsProcessDebugged())
-		{
-			if(mprotect(addr, size, PROT_READ | PROT_WRITE) == 0) return true;
-		}
+		os_log_error(GetJitLog(), "MAP_JIT failed: errno=%d (%{public}s)", errno, strerror(errno));
+		return nullptr;
 	}
-	return false;
+	os_log_info(GetJitLog(), "MAP_JIT succeeded at %p size=%zu", p, allocSize);
+	return p;
+}
+
+static void* AllocateRxMprotect(size_t allocSize)
+{
+	void* p = mmap(nullptr, allocSize, PROT_READ | PROT_EXEC, MAP_ANON | MAP_PRIVATE, -1, 0);
+	if(p == MAP_FAILED)
+	{
+		os_log_error(GetJitLog(), "RX mmap failed: errno=%d (%{public}s)", errno, strerror(errno));
+		return nullptr;
+	}
+	if(mprotect(p, allocSize, PROT_READ | PROT_WRITE) != 0)
+	{
+		os_log_error(GetJitLog(), "RX->RW toggle failed: errno=%d (%{public}s)", errno, strerror(errno));
+		munmap(p, allocSize);
+		return nullptr;
+	}
+	if(mprotect(p, allocSize, PROT_READ | PROT_EXEC) != 0)
+	{
+		os_log_error(GetJitLog(), "RW->RX toggle failed: errno=%d (%{public}s)", errno, strerror(errno));
+		munmap(p, allocSize);
+		return nullptr;
+	}
+	os_log_info(GetJitLog(), "RX mprotect strategy succeeded at %p size=%zu", p, allocSize);
+	return p;
 }
 #endif
 
@@ -173,19 +208,42 @@ CMemoryFunction::CMemoryFunction(const void* code, size_t size)
 	kern_return_t result = vm_protect(mach_task_self(), reinterpret_cast<vm_address_t>(m_code), size, 0, protection);
 	assert(result == 0);
 	m_size = allocSize;
-#elif defined(MEMFUNC_USE_IOS_TXM)
+#elif defined(MEMFUNC_USE_IOS_JIT)
 	long page_size = sysconf(_SC_PAGESIZE);
 	size_t allocSize = ((size + page_size - 1) / page_size) * page_size;
 
-	m_code = mmap(nullptr, allocSize, PROT_READ | PROT_WRITE, MAP_ANON | MAP_PRIVATE, -1, 0);
-	assert(m_code != MAP_FAILED);
+	WaitForDebugger();
 
-	memcpy(m_code, code, size);
-
-	bool rxOk = MakeExecutableWithRetry(m_code, allocSize);
-	if(!rxOk) abort();
-
-	m_size = allocSize;
+	void* jitMem = AllocateMapJit(allocSize);
+	if(jitMem)
+	{
+		g_jitStrategy = IosJitStrategy::MapJit;
+		m_code = jitMem;
+		m_codeRW = jitMem;
+		pthread_jit_write_protect_np(0);
+		memcpy(m_code, code, size);
+		pthread_jit_write_protect_np(1);
+		m_size = allocSize;
+	}
+	else
+	{
+		void* rxMem = AllocateRxMprotect(allocSize);
+		if(rxMem)
+		{
+			g_jitStrategy = IosJitStrategy::RxMprotect;
+			m_code = rxMem;
+			m_codeRW = rxMem;
+			mprotect(m_code, allocSize, PROT_READ | PROT_WRITE);
+			memcpy(m_code, code, size);
+			mprotect(m_code, allocSize, PROT_READ | PROT_EXEC);
+			m_size = allocSize;
+		}
+		else
+		{
+			os_log_fault(GetJitLog(), "All JIT strategies failed — aborting");
+			abort();
+		}
+	}
 #elif defined(MEMFUNC_USE_MMAP)
 	uint32 additionalMapFlags = 0;
 	#ifdef MEMFUNC_MMAP_ADDITIONAL_FLAGS
@@ -236,7 +294,7 @@ void CMemoryFunction::Reset()
 		framework_aligned_free(m_code);
 #elif defined(MEMFUNC_USE_MACHVM)
 		vm_deallocate(mach_task_self(), reinterpret_cast<vm_address_t>(m_code), m_size);
-#elif defined(MEMFUNC_USE_IOS_TXM)
+#elif defined(MEMFUNC_USE_IOS_JIT)
 		munmap(m_code, m_size);
 #elif defined(MEMFUNC_USE_MMAP)
 		munmap(m_code, m_size);
@@ -291,8 +349,18 @@ void CMemoryFunction::BeginModify()
 #if defined(MEMFUNC_USE_MACHVM) && defined(MEMFUNC_MACHVM_STRICT_PROTECTION)
 	kern_return_t result = vm_protect(mach_task_self(), reinterpret_cast<vm_address_t>(m_code), m_size, 0, VM_PROT_READ | VM_PROT_WRITE);
 	assert(result == 0);
-#elif defined(MEMFUNC_USE_IOS_TXM)
-	MakeWritableWithRetry(m_code, m_size);
+#elif defined(MEMFUNC_USE_IOS_JIT)
+	switch(g_jitStrategy)
+	{
+	case IosJitStrategy::MapJit:
+		pthread_jit_write_protect_np(0);
+		break;
+	case IosJitStrategy::RxMprotect:
+		mprotect(m_code, m_size, PROT_READ | PROT_WRITE);
+		break;
+	default:
+		break;
+	}
 #elif defined(MEMFUNC_USE_MMAP) && defined(MEMFUNC_MMAP_REQUIRES_JIT_WRITE_PROTECT)
 	pthread_jit_write_protect_np(false);
 #endif
@@ -303,8 +371,18 @@ void CMemoryFunction::EndModify()
 #if defined(MEMFUNC_USE_MACHVM) && defined(MEMFUNC_MACHVM_STRICT_PROTECTION)
 	kern_return_t result = vm_protect(mach_task_self(), reinterpret_cast<vm_address_t>(m_code), m_size, 0, VM_PROT_READ | VM_PROT_EXECUTE);
 	assert(result == 0);
-#elif defined(MEMFUNC_USE_IOS_TXM)
-	MakeExecutableWithRetry(m_code, m_size);
+#elif defined(MEMFUNC_USE_IOS_JIT)
+	switch(g_jitStrategy)
+	{
+	case IosJitStrategy::MapJit:
+		pthread_jit_write_protect_np(1);
+		break;
+	case IosJitStrategy::RxMprotect:
+		mprotect(m_code, m_size, PROT_READ | PROT_EXEC);
+		break;
+	default:
+		break;
+	}
 #elif defined(MEMFUNC_USE_MMAP) && defined(MEMFUNC_MMAP_REQUIRES_JIT_WRITE_PROTECT)
 	pthread_jit_write_protect_np(true);
 #endif
