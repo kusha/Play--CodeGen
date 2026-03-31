@@ -85,18 +85,33 @@ EM_JS(emscripten::EM_VAL, WasmCreateModule, (uintptr_t code, uintptr_t size),
 #endif
 
 #ifdef MEMFUNC_USE_IOS_TXM
-// JIT26PrepareRegion: triggers brk #0xf00d breakpoint that StikDebug catches.
-// StikDebug's universal.js script handles x16=1 by calling prepare_memory_region()
-// to mark the memory as a JIT region in iOS 26's TXM (Trust eXecution Monitor).
-// x0 = address, x1 = size, x16 = command (1 = prepare region)
-__attribute__((noinline, optnone, naked))
-static void* JIT26PrepareRegion(void* addr, size_t size)
+#include <errno.h>
+
+extern "C" int csops(pid_t pid, unsigned int ops, void* useraddr, size_t usersize);
+
+static bool IsProcessDebugged()
 {
-    __asm__ volatile(
-        "mov x16, #1\n"
-        "brk #0xf00d\n"
-        "ret\n"
-    );
+	uint32_t flags = 0;
+	if(csops(getpid(), 0 /* CS_OPS_STATUS */, &flags, sizeof(flags)) != 0) return false;
+	return (flags & 0x10000000 /* CS_DEBUGGED */) != 0;
+}
+
+static bool MakeExecutableWithRetry(void* addr, size_t size)
+{
+	if(mprotect(addr, size, PROT_READ | PROT_EXEC) == 0) return true;
+
+	if(errno == EPERM || errno == EACCES)
+	{
+		for(int i = 0; i < 40; i++)
+		{
+			usleep(50000);
+			if(IsProcessDebugged())
+			{
+				if(mprotect(addr, size, PROT_READ | PROT_EXEC) == 0) return true;
+			}
+		}
+	}
+	return false;
 }
 #endif
 
@@ -163,11 +178,8 @@ CMemoryFunction::CMemoryFunction(const void* code, size_t size)
 								false, &cur_prot, &max_prot, VM_INHERIT_NONE);
 	assert(kr == KERN_SUCCESS);
 
-	void* preparedAddr = JIT26PrepareRegion(reinterpret_cast<void*>(rxMapping), allocSize);
-	if(preparedAddr != nullptr && preparedAddr != reinterpret_cast<void*>(rxMapping))
-	{
-		rxMapping = reinterpret_cast<vm_address_t>(preparedAddr);
-	}
+	bool rxOk = MakeExecutableWithRetry(reinterpret_cast<void*>(rxMapping), allocSize);
+	assert(rxOk);
 
 	memcpy(rwMapping, code, size);
 
